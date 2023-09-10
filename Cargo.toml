@@ -1,0 +1,11 @@
+[package]
+name = "vncvwr"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies.framebuffer]
+path = "../rust-framebuffer"
+
+#[dependencies]
+#des = "0.8.1"
+
