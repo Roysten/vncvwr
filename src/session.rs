@@ -7,6 +7,10 @@ use std::net::TcpStream;
 pub struct Session {
     stream: TcpStream,
     rfb_version: rfb::RfbVersion,
+    pixel_format: Option<PixelFormat>,
+    screen_w: u16,
+    screen_h: u16,
+    name: String,
 }
 
 #[derive(Debug)]
@@ -14,6 +18,61 @@ pub enum HandshakeError {
     IoError(std::io::Error),
     UnsupportedRfbVersion,
     UnsupportedSecurity(String),
+    UnsupportedServerSettings(String),
+}
+
+#[derive(Debug)]
+pub struct PixelFormat {
+    bits_per_pixel: u8,
+    depth: u8,
+    big_endian_flag: u8,
+    true_color_flag: u8,
+    red_max: u16,
+    green_max: u16,
+    blue_max: u16,
+    red_shift: u8,
+    green_shift: u8,
+    blue_shift: u8,
+}
+
+impl From<[u8; 16]> for PixelFormat {
+    fn from(src: [u8; 16]) -> Self {
+        PixelFormat {
+            bits_per_pixel: src[0],
+            depth: src[1],
+            big_endian_flag: src[2],
+            true_color_flag: src[3],
+            red_max: u16::from_be_bytes([src[4], src[5]]),
+            green_max: u16::from_be_bytes([src[6], src[7]]),
+            blue_max: u16::from_be_bytes([src[8], src[9]]),
+            red_shift: src[10],
+            green_shift: src[11],
+            blue_shift: src[12],
+        }
+    }
+}
+
+impl From<&PixelFormat> for [u8; 16] {
+    fn from(src: &PixelFormat) -> Self {
+        [
+            src.bits_per_pixel,
+            src.depth,
+            src.big_endian_flag,
+            src.true_color_flag,
+            (src.red_max >> 8) as u8,
+            src.red_max as u8,
+            (src.green_max >> 8) as u8,
+            src.green_max as u8,
+            (src.blue_max >> 8) as u8,
+            src.blue_max as u8,
+            src.red_shift,
+            src.green_shift,
+            src.blue_shift,
+            0u8,
+            0u8,
+            0u8,
+        ]
+    }
 }
 
 impl From<std::io::Error> for HandshakeError {
@@ -23,12 +82,96 @@ impl From<std::io::Error> for HandshakeError {
 }
 
 impl Session {
+    pub const PREFERRED_PIXEL_FORMAT: PixelFormat = PixelFormat {
+        bits_per_pixel: 32,
+        depth: 24,
+        big_endian_flag: 0,
+        true_color_flag: 1,
+        red_max: 255,
+        green_max: 255,
+        blue_max: 255,
+        red_shift: 16,
+        green_shift: 8,
+        blue_shift: 0,
+    };
+
     pub fn new(address: &str, port: u16) -> Result<Self, std::io::Error> {
         let stream = TcpStream::connect((address, port))?;
         Ok(Self {
             stream: stream,
             rfb_version: rfb::RfbVersion::Unsupported,
+            pixel_format: None,
+            screen_w: 0,
+            screen_h: 0,
+            name: String::new(),
         })
+    }
+
+    pub fn handshake(&mut self) -> Result<(), HandshakeError> {
+        self.rfb_version = Self::handle_protocol_version(&mut self.stream)?;
+        let security = Self::handle_security_handshake(&mut self.stream)?;
+
+        let shared = [0u8];
+        self.stream.write_all(&shared);
+
+        self.screen_w = Self::read_u16(&mut self.stream)?;
+        self.screen_h = Self::read_u16(&mut self.stream)?;
+
+        let mut pixel_format = [0u8; 16];
+        self.stream.read_exact(&mut pixel_format)?;
+        self.pixel_format = Some(pixel_format.into());
+
+        let name_len = Self::read_u32(&mut self.stream)?;
+        if name_len > 1000 {
+            return Err(HandshakeError::UnsupportedServerSettings(
+                "Too long name".to_string(),
+            ));
+        }
+        let mut name = Self::read_dynamic(&mut self.stream, name_len as usize)?;
+        self.name = String::from_utf8(name).unwrap();
+        Ok(())
+    }
+
+    pub fn set_pixel_format(&mut self, format: &PixelFormat) -> Result<(), std::io::Error> {
+        self.stream.write_all(&[0u8, 0, 0, 0])?;
+        let encoded: [u8; 16] = format.into();
+        self.stream.write_all(&encoded[..])
+    }
+
+    /**
+     * Set encodings in order of preference. First element is most preferred.
+     */
+    pub fn set_encodings(&mut self, encodings: &[rfb::Encoding]) -> Result<(), std::io::Error> {
+        let encoding_data: Vec<u8> = encodings
+            .iter()
+            .map(|&x| (x as i32).to_be_bytes())
+            .flatten()
+            .collect();
+        let len_data = (encodings.len() as u16).to_be_bytes();
+        self.stream.write_all(&[2u8, 0, len_data[0], len_data[1]])?;
+        self.stream.write_all(&encoding_data)
+    }
+
+    pub fn framebuffer_update_request(
+        &mut self,
+        incremental: bool,
+        xpos: u16,
+        ypos: u16,
+        width: u16,
+        height: u16,
+    ) -> Result<(), std::io::Error> {
+        self.stream.write_all(&[
+            3u8,
+            incremental as u8,
+            (xpos >> 8) as u8,
+            xpos as u8,
+            (ypos >> 8) as u8,
+            ypos as u8,
+            (width >> 8) as u8,
+            width as u8,
+            (height >> 8) as u8,
+            height as u8,
+        ])
     }
 
     fn read_u8(stream: &mut TcpStream) -> Result<u8, std::io::Error> {
@@ -54,33 +197,6 @@ impl Session {
         buf.resize(len, 0);
         stream.read_exact(buf.as_mut_slice())?;
         Ok(buf)
-    }
-
-    pub fn handshake(&mut self) -> Result<(), HandshakeError> {
-        self.rfb_version = Self::handle_protocol_version(&mut self.stream)?;
-        let security = Self::handle_security_handshake(&mut self.stream)?;
-
-        let shared = [0u8];
-        self.stream.write_all(&shared);
-
-        let w = Self::read_u16(&mut self.stream)?;
-        let h = Self::read_u16(&mut self.stream)?;
-        let mut pixel_format = [0u8; 16];
-        self.stream.read_exact(&mut pixel_format);
-        let name_len = Self::read_u32(&mut self.stream)?;
-        if name_len > 1000 {
-            return Err(HandshakeError::UnsupportedRfbVersion);
-        }
-        let mut name = Self::read_dynamic(&mut self.stream, name_len as usize)?;
-        let name = String::from_utf8(name);
-        println!(
-            "w: {} h: {} name len: {} name: {:?}",
-            w,
-            h,
-            name_len,
-            name.unwrap()
-        );
-        Ok(())
     }
 
     fn handle_protocol_version(stream: &mut TcpStream) -> Result<rfb::RfbVersion, HandshakeError> {

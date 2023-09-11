@@ -13,6 +13,18 @@ pub enum RfbVersion {
     Unsupported,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Encoding {
+    Raw = 0,
+    CopyRect = 1,
+    RRE = 2,
+    Hextile = 5,
+    TRLE = 15,
+    ZRLE = 16,
+    CursorPseudo = -239,
+    DesktopSizePseudo = -223,
+}
+
 fn as_digit(ascii_char: u8) -> u8 {
     ascii_char - b'0'
 }
